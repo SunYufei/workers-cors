@@ -1,0 +1,13 @@
+name = "tunnel"
+main = "src/index.ts"
+compatibility_date = "2023-10-10"
+
+# Variable bindings. These are arbitrary, plaintext strings (similar to environment variables)
+# Note: Use secrets to store sensitive data.
+# Docs: https://developers.cloudflare.com/workers/platform/environment-variables
+[vars]
+UUID = ""
+# ['cdn-all.xn--b6gac.eu.org', 'cdn.xn--b6gac.eu.org', 'cdn-b100.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cdn.anycast.eu.org']
+PROXY_IP = "edgetunnel.anycast.eu.org"
+# https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
+DNS_RESOLVER_URL = "https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg="
