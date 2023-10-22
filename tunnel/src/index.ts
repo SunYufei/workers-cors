@@ -31,6 +31,7 @@ export default {
       }
       if (pathname == `/${userId}`) {
          // VLESS config HTML
+         return vlessConfigResponse(userId, env.PROXY_IP, request.headers.get('Host'))
       }
       // For any other path, reverse proxy to 'www.fmprc.gov.cn' and return the original response, caching it in the process
       // Note: remove any other hostname and caching process
@@ -55,4 +56,31 @@ async function socketTest(hostname: string, port = 80): Promise<Response> {
       reader.releaseLock()
       await socket.close()
    }
+}
+
+function vlessConfigResponse(userId: string, proxy: string, hostname: string | null): Response {
+   const line = '-'.repeat(36)
+   const body = `${line}
+Workers-VLESS-WebSocket 分享链接
+${line}
+vless://${userId}@${proxy}:80?encryption=none&security=none&type=ws&host=${hostname}&path=%2F%3Fed%3D2048#Workers%20VLESS
+${line}
+客户端参数
+${line}
+地址(address): ${proxy}
+端口(port): 80
+
+用户ID(id): ${userId}
+level: 0
+流控(flow):
+加密方式(encryption): none
+
+传输协议(network): ws
+伪装类型(type): none
+伪装域名(host): ${hostname}
+路径(path): /?ed=2048
+
+传输层安全(TLS/security): none
+${line}`
+   return textResponse(body)
 }
