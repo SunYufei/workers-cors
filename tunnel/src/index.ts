@@ -1,6 +1,7 @@
 import { connect } from 'cloudflare:sockets'
 import { errorResponse, jsonResponse, textResponse } from './resp'
 import { notValidUUID } from './util'
+import { vlessOverWebSocketHandler } from './vless'
 
 export interface Env {
    UUID: string
@@ -18,6 +19,7 @@ export default {
       const upgradeHeader = request.headers.get('Upgrade')
       if (upgradeHeader == 'websocket') {
          // VLESS over WebSocket handler
+         return vlessOverWebSocketHandler(request, userId, env.DNS_RESOLVER_URL)
       }
       // HTTP path
       const url = new URL(request.url)
