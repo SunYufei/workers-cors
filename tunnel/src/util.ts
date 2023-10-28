@@ -26,3 +26,25 @@ export const byteToHex = (array: Uint8Array) =>
  */
 export const slice = (buffer: ArrayBuffer, begin: number, length: number) =>
    buffer.slice(begin, begin + length)
+
+/**
+ * Decodes a base64 string into an ArrayBuffer.
+ * @param base64Str The base64 string to decode.
+ * @returns An object containing the decoded ArrayBuffer or null if there was an error, and any error that occurred during decoding or null if there was no error.
+ */
+export function base64ToArrayBuffer(base64Str: string | null): {
+   buffer: ArrayBuffer | null
+   error: Error | null
+} {
+   if (!base64Str) {
+      return { buffer: null, error: null }
+   }
+   try {
+      // go use modified Base64 for URL rfc4648 which js atob not support
+      const decode = atob(base64Str.replace(/-/g, '+').replace(/_/g, '/'))
+      const array = Uint8Array.from(decode, (c) => c.charCodeAt(0))
+      return { buffer: array.buffer, error: null }
+   } catch (e) {
+      return { buffer: null, error: <Error>e }
+   }
+}

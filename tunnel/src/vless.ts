@@ -1,4 +1,5 @@
-import { byteToHex, slice } from './util'
+import { DNS_HEADER } from './resp'
+import { base64ToArrayBuffer, byteToHex, slice } from './util'
 
 // Command in VLESS request
 const TCP = 1
@@ -8,6 +9,18 @@ const MUX = 3
 const IPV4 = 1
 const DOMAIN_NAME = 2
 const IPV6 = 3
+
+// VLESS handler logger
+let logAddress = ''
+let logPort = ''
+const logInfo = (text: string, ...data: any[]) =>
+   console.log(`[${new Date()} ${logAddress}:${logPort}]`, text, data)
+const logError = (text: string, e: unknown) =>
+   console.error(`[${new Date()} ${logAddress}:${logPort}]`, text, e)
+
+// WebSocket ready state
+const WS_READY_STATE_OPEN = 1
+const WS_READY_STATE_CLOSING = 2
 
 /**
  * Handles VLESS over WebSocket requests by creating a WebSocket pair, accepting the WebSocket connection, and processing the VLESS header.
@@ -24,8 +37,115 @@ export async function vlessOverWebSocketHandler(
    const [client, server] = Object.values(new WebSocketPair())
    server.accept()
 
+   const earlyDataHeader = request.headers.get('sec-websocket-protocol')
+   const readableWebSocketStream = makeReadableWebSocketStream(server, earlyDataHeader)
+
+   // ws --> remote
+   let isDNS = false
+   let udpStreamWriteFunc: ((chunk: Uint8Array) => void) | null = null
+   let remoteSocketWrapper: Socket | null = null
+   readableWebSocketStream
+      .pipeTo(
+         new WritableStream({
+            async write(chunk, controller) {
+               if (isDNS && udpStreamWriteFunc) {
+                  udpStreamWriteFunc(chunk)
+                  return
+               }
+               if (remoteSocketWrapper) {
+                  const writer = remoteSocketWrapper.writable.getWriter()
+                  await writer.write(chunk)
+                  writer.releaseLock()
+                  return
+               }
+
+               const { vlessVersion, isUDP, portRemote, addressRemote, requestData } =
+                  processVLESSRequest(chunk, userId)
+
+               // Update address and port to Logger
+               logAddress = addressRemote
+               logPort = `${portRemote} ${isUDP ? 'UDP' : 'TCP'}`
+
+               // If UDP and not DNS port, close it
+               if (isUDP && portRemote != 53) {
+                  // cf seems has bug, controller.error will not end stream
+                  throw new Error('UDP proxy only enabled for DNS which is port 53')
+               }
+
+               if (isUDP && portRemote == 53) {
+                  isDNS = true
+               }
+
+               // VLESS response
+               // 0, +1 Protocol version
+               // 1, +1 Extend message length (N)
+               // 2, +N Extend message (ProtoBuf)
+               // 2+N, +Y Response data
+               const vlessResponseHeader = new Uint8Array([vlessVersion, 0])
+
+               // TODO: support udp here when cf runtime has udp support
+               if (isDNS) {
+                  const writeFunc = handleUDPOutBound(server, vlessResponseHeader, dohURL)
+                  udpStreamWriteFunc = writeFunc
+                  udpStreamWriteFunc(new Uint8Array(requestData))
+                  return
+               } else {
+               }
+            },
+
+            close() {
+               logInfo('readableWebSocketStream is close')
+            },
+
+            abort(reason) {
+               logInfo('readableWebSocketStream is abort', reason)
+            },
+         })
+      )
+      .catch((e) => logError('readableWebSocketStream pipeTo error', e))
+
    return new Response(null, { status: 101, webSocket: client })
 }
+
+/**
+ * Creates a readable stream from a WebSocket server, allowing for data to be read from the WebSocket.
+ * @param socketServer The WebSocket server to create the readable stream from.
+ * @param earlyDataHeader The header containing early data for WebSocket 0-RTT.
+ * @returns A readable stream that can be used to read data from the WebSocket.
+ */
+const makeReadableWebSocketStream = (socketServer: WebSocket, earlyDataHeader: string | null) =>
+   new ReadableStream({
+      start(controller) {
+         socketServer.addEventListener('message', (event) => controller.enqueue(event.data))
+
+         socketServer.addEventListener('close', () => {
+            safeCloseWebSocket(socketServer)
+            controller.close()
+         })
+
+         socketServer.addEventListener('error', (e) => {
+            logError('WebSocket server has error', e)
+            controller.error(e)
+         })
+
+         const { buffer, error } = base64ToArrayBuffer(earlyDataHeader)
+         if (error) {
+            controller.error(error)
+         } else if (buffer) {
+            controller.enqueue(buffer)
+         }
+      },
+
+      pull(controller) {
+         // if ws can stop read if stream is full, we can implement backpressure
+         // https://streams.spec.whatwg.org/#example-rs-push-backpressure
+      },
+
+      cancel(reason) {
+         logInfo('ReadableStream was canceled, due to', reason)
+         safeCloseWebSocket(socketServer)
+      },
+   })
 
 /**
  * Processes the VLESS request buffer and returns an object with the relevant information.
@@ -112,5 +232,87 @@ function processVLESSRequest(
       addressType,
       addressRemote: addressValue,
       requestData,
+   }
+}
+
+/**
+ * Handles outbound UDP traffic by transforming the data into DNS queries and sending them over a WebSocket connection.
+ * @param webSocket The WebSocket connection to send the DNS queries over.
+ * @param vlessResponseHeader The VLESS response header.
+ * @param dohURL DNS server url.
+ * @returns An object with a write method that accepts a Uint8Array chunk to write to the transform stream.
+ */
+function handleUDPOutBound(
+   webSocket: WebSocket,
+   vlessResponseHeader: ArrayBuffer,
+   dohURL: string
+): (chunk: Uint8Array) => void {
+   let isVLESSHeaderSent = false
+   const transformStream = new TransformStream({
+      start(controller) {},
+
+      transform(chunk: ArrayBuffer, controller) {
+         // UDP message 2 byte is the the length of UDP data
+         // TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+         for (let i = 0; i < chunk.byteLength; ) {
+            const packetLength = new DataView(chunk, i, i + 2).getUint16(0)
+            const data = new Uint8Array(slice(chunk, i + 2, packetLength))
+            i = i + 2 + packetLength
+            controller.enqueue(data)
+         }
+      },
+
+      flush(controller) {},
+   })
+
+   // Only handle DNS UDP for now
+   transformStream.readable
+      .pipeTo(
+         new WritableStream({
+            async write(chunk, controller) {
+               const resp = await fetch(dohURL, {
+                  method: 'POST',
+                  headers: DNS_HEADER,
+                  body: chunk,
+               })
+               const dnsQueryResult = await resp.arrayBuffer()
+               const udpSize = dnsQueryResult.byteLength
+               const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff])
+               if (webSocket.readyState == WS_READY_STATE_OPEN) {
+                  logInfo('DoH success and DNS message length is', udpSize)
+                  if (isVLESSHeaderSent) {
+                     webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer())
+                  } else {
+                     webSocket.send(
+                        await new Blob([
+                           vlessResponseHeader,
+                           udpSizeBuffer,
+                           dnsQueryResult,
+                        ]).arrayBuffer()
+                     )
+                     isVLESSHeaderSent = true
+                  }
+               }
+            },
+         })
+      )
+      .catch((e) => logError('DNS UDP has error', e))
+
+   const writer = transformStream.writable.getWriter()
+
+   return writer.write
+}
+
+/**
+ * Closes a WebSocket connection safely without throwing exceptions.
+ * @param socket The WebSocket connection to close.
+ */
+function safeCloseWebSocket(socket: WebSocket) {
+   try {
+      if (socket.readyState == WS_READY_STATE_OPEN || socket.readyState == WS_READY_STATE_CLOSING) {
+         socket.close()
+      }
+   } catch (e) {
+      console.error('safeCloseWebSocket error', e)
    }
 }
