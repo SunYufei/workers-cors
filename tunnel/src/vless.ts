@@ -1,3 +1,4 @@
+import { connect } from 'cloudflare:sockets'
 import { DNS_HEADER } from './resp'
 import { base64ToArrayBuffer, byteToHex, slice } from './util'
 
@@ -32,6 +33,7 @@ const WS_READY_STATE_CLOSING = 2
 export async function vlessOverWebSocketHandler(
    request: Request,
    userId: string,
+   proxyIP: string,
    dohURL: string
 ): Promise<Response> {
    const [client, server] = Object.values(new WebSocketPair())
@@ -87,9 +89,18 @@ export async function vlessOverWebSocketHandler(
                if (isDNS) {
                   const writeFunc = handleUDPOutBound(server, vlessResponseHeader, dohURL)
                   udpStreamWriteFunc = writeFunc
-                  udpStreamWriteFunc(new Uint8Array(requestData))
+                  udpStreamWriteFunc(requestData)
                   return
                } else {
+                  handleTCPOutBound(
+                     remoteSocketWrapper,
+                     proxyIP,
+                     addressRemote,
+                     portRemote,
+                     requestData,
+                     server,
+                     vlessResponseHeader
+                  )
                }
             },
 
@@ -301,6 +312,121 @@ function handleUDPOutBound(
    const writer = transformStream.writable.getWriter()
 
    return writer.write
+}
+
+/**
+ * Handles outbound TCP connections.
+ * @param remoteSocket
+ * @param proxyIP
+ * @param addressRemote The remote address to connect to.
+ * @param portRemote The remote port to connect to.
+ * @param requestData The VLESS request data to write.
+ * @param webSocket The WebSocket to pass the remote socket to.
+ * @param vlessResponseHeader The VLESS response header.
+ */
+async function handleTCPOutBound(
+   remoteSocket: Socket | null,
+   proxyIP: string,
+   addressRemote: string,
+   portRemote: number,
+   requestData: Uint8Array,
+   webSocket: WebSocket,
+   vlessResponseHeader: Uint8Array
+) {
+   /**
+    * Connects to a given address and port and writes data to the socket.
+    * @param address The address to connect to.
+    * @param port The port to connect to.
+    * @returns A promise that resolves to the connected socket.
+    */
+   async function connectAndWrite(address: string, port: number): Promise<Socket> {
+      const socket = connect({
+         hostname: address,
+         port: port,
+      })
+      remoteSocket = socket
+      logInfo(`Connect to ${address}:${port}`)
+      const writer = socket.writable.getWriter()
+      await writer.write(requestData) // first write, normal is TLS client hello
+      writer.releaseLock()
+      return socket
+   }
+
+   /**
+    * Retries connecting to the remote address and port if the Cloudflare socket has no incoming data.
+    */
+   async function retry() {
+      const socket = await connectAndWrite(proxyIP || addressRemote, portRemote)
+      socket.closed
+         .catch((e) => logError('Retry TCP socket closed error', e))
+         .finally(() => safeCloseWebSocket(webSocket))
+      await remoteSocketToWebSocket(socket, webSocket, vlessResponseHeader, null)
+   }
+
+   const socket = await connectAndWrite(addressRemote, portRemote)
+
+   // when remote socket is ready, pass to WebSocket
+   // remote --> ws
+   remoteSocketToWebSocket(socket, webSocket, vlessResponseHeader, retry)
+}
+
+/**
+ * Converts a remote socket to a WebSocket connection.
+ * @param remoteSocket The remote socket to convert.
+ * @param webSocket The WebSocket to connect to.
+ * @param vlessResponseHeader The VLESS response heeader.
+ * @param retry The function to retry the connection if it fails.
+ */
+async function remoteSocketToWebSocket(
+   remoteSocket: Socket,
+   webSocket: WebSocket,
+   vlessResponseHeader: ArrayBuffer,
+   retry: (() => Promise<void>) | null
+) {
+   // remote --> ws
+   let remoteChunkCount = 0
+   let vlessHeader: ArrayBuffer | null = vlessResponseHeader
+   let hasIncomingData = false // check if remoteSocket has incoming data
+   await remoteSocket.readable
+      .pipeTo(
+         new WritableStream({
+            start(controller) {},
+
+            async write(chunk: Uint8Array, controller) {
+               hasIncomingData = true
+               remoteChunkCount += 1
+               if (webSocket.readyState != WS_READY_STATE_OPEN) {
+                  controller.error('webSocket.readyState maybe closed')
+               }
+               if (vlessHeader) {
+                  webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer())
+                  vlessHeader = null
+               } else {
+                  webSocket.send(chunk)
+               }
+            },
+
+            close() {
+               logInfo('remoteConnection.readable is closeh hasIncomingData is', hasIncomingData)
+            },
+
+            abort(reason) {
+               logError('remoteConnection.readable abort', reason)
+            },
+         })
+      )
+      .catch((e) => {
+         logError('remoteSocketToWebSocket has exception', e)
+         safeCloseWebSocket(webSocket)
+      })
+
+   // seems is cf connect socket has error,
+   // 1. Socket.closed will have error
+   // 2. Socket.readable will be close without any data coming
+   if (hasIncomingData == false && retry) {
+      logInfo('retry')
+      retry()
+   }
 }
 
 /**
